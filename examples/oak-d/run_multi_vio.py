@@ -32,7 +32,7 @@ except ImportError:
 # ==========  Configuration ==========
 # 默认值：可视化开启，HDF5保存开启
 # 可以通过修改下面两行为 False 来改变默认行为；环境变量优先级更高
-DEFAULT_ENABLE_VIZ = True
+DEFAULT_ENABLE_VIZ = False
 DEFAULT_ENABLE_HDF5 = False
 
 # 环境变量覆盖默认值（终端传参方式：ENABLE_VIZ=0 python3 run_multi_vio.py）
@@ -101,6 +101,10 @@ def ts_to_ns(ts):
 
 def color_from_id(uid): return [(uid*17)%256, (uid*31)%256, (uid*47)%256]
 
+def ros2_camera_id(camera_id):
+    ros2_id_map = {0: 41, 1: 46, 2: 40, 3: 29}
+    return ros2_id_map.get(camera_id, camera_id)
+
 # ==========  ROS2 Publisher ==========
 class CameraPosePublisher(Node):
     def __init__(self, cid):
@@ -126,7 +130,7 @@ class CameraPosePublisher(Node):
 def vio_process(camera_id, device_id, num_cameras, vis_queue, traj_queue, enable_viz):
     if ROS2_AVAILABLE:
         rclpy.init(args=None)
-        ros_node = CameraPosePublisher(camera_id)
+        ros_node = CameraPosePublisher(ros2_camera_id(camera_id))
     else:
         ros_node = None
 
