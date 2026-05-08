@@ -46,7 +46,7 @@ WARMUP_FRAMES = 60
 IMAGE_JITTER_THRESHOLD_NS = 35 * 1e6
 IMU_JITTER_THRESHOLD_NS = 6 * 1e6
 IMU_FREQUENCY = 200
-BORDER_TOP, BORDER_BOTTOM, BORDER_LEFT, BORDER_RIGHT = 10, 10, 10, 10
+BORDER_TOP, BORDER_BOTTOM, BORDER_LEFT, BORDER_RIGHT = 15, 15, 15, 15
 CM_TO_METERS = 100
 
 IMU_GYROSCOPE_NOISE_DENSITY = 6.0673370376614875e-03 * 1
@@ -146,7 +146,7 @@ def vio_process(camera_id, device_id, num_cameras, vis_queue, traj_queue, enable
     rig.imus = [get_imu_calib(imu_extr)]
 
     odom_cfg = vslam.Tracker.OdometryConfig(
-        async_sba=False,
+        async_sba=True,
         enable_final_landmarks_export=True,
         enable_observations_export=True,
         rectified_stereo_camera=False,
