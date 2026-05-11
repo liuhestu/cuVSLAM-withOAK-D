@@ -6,7 +6,7 @@ Use environment vars to override defaults:
   ENABLE_HDF5=0  -> disable trajectory saving
 """
 
-import os, sys, time, signal
+import os, sys, time, signal, gc
 from datetime import timedelta
 from multiprocessing import Process, Queue, set_start_method
 from collections import deque
@@ -16,6 +16,7 @@ import depthai as dai
 from scipy.spatial.transform import Rotation
 import cuvslam as vslam
 import h5py
+import psutil
 import rerun as rr
 import rerun.blueprint as rrb
 
@@ -54,6 +55,43 @@ IMU_GYROSCOPE_RANDOM_WALK = 3.6211951458325785e-05 * 1
 IMU_ACCELEROMETER_NOISE_DENSITY = 3.3621979208052800e-02 * 1
 IMU_ACCELEROMETER_RANDOM_WALK = 9.8256589971851467e-04 * 1
 
+# ----------  memory watchdog ----------
+MEMORY_CRITICAL = 0.92       # auto-terminate at 92% system RAM
+MEMORY_CHECK_INTERVAL = 2.0  # seconds between memory checks
+VIZ_FRAME_SKIP = 3           # send every Nth frame to vis queue
+
+# ----------  coordinate system ----------
+# cuVSLAM uses OpenCV convention: X-right, Y-down, Z-forward
+# Set to "ros" for X-forward, Y-left, Z-up (matching OAK official convention)
+POSE_CONVENTION = "ros"
+
+# Per-camera mounting orientation: "normal" (right-side up) or "inverted" (180° around Z)
+# Keyed by logical camera ID (cid). Empty = all normal.
+CAMERA_MOUNTING = {41: "inverted", 46:"inverted"}
+
+# Map MXID (hardware serial) → logical camera ID, so the same physical camera
+# always gets the same cid regardless of USB port. Run once to see MXIDs, then
+# fill in. Empty = auto-assign by enumeration order.
+# Example: {"1944301091C0187E00": 0, "19443010A1AC187E00": 1}
+CAMERA_ID_MAP = {
+    "14442C1091AFD5D200": 29,   # 右下
+    "19443010A1AC187E00": 40,   # 左下
+    "19443010D1061C7E00": 41,   # 左上
+    "1944301091C0187E00": 46,   # 右上
+    }
+
+
+def resolve_camera_id(mxid, fallback):
+    """Return the user-assigned logical camera ID for a given MXID, or fallback."""
+    if mxid in CAMERA_ID_MAP:
+        return CAMERA_ID_MAP[mxid]
+    print(f"Warning: MXID {mxid} not in CAMERA_ID_MAP, using fallback cid={fallback}")
+    return fallback
+
+# Change-of-basis: cuVSLAM (X-right, Y-down, Z-forward) → ROS (X-forward, Y-left, Z-up)
+_R_CUVSLAM_TO_ROS = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=float)
+_Q_CUVSLAM_TO_ROS = Rotation.from_matrix(_R_CUVSLAM_TO_ROS).as_quat()  # [x, y, z, w]
+
 # ==========  Helper Functions ==========
 def oak_transform_to_pose(extr):
     arr = np.array(extr)
@@ -81,6 +119,10 @@ def get_stereo_calib(calib, res):
     return s
 
 def get_imu_calib(extr):
+    # DepthAI firmware pre-rotates IMU readings (ACCELEROMETER_RAW) into the
+    # camera coordinate frame (X-right, Y-down, Z-forward). The EEPROM extrinsics
+    # matrix contains the physical chip rotation — applying it would double-rotate.
+    # So we use identity rotation and keep only the translation offset.
     imu = vslam.ImuCalibration()
     t = np.array(extr)[:3,3] / CM_TO_METERS
     imu.rig_from_imu = vslam.Pose(rotation=np.array([0.,0.,0.,1.]), translation=t)
@@ -101,9 +143,24 @@ def ts_to_ns(ts):
 
 def color_from_id(uid): return [(uid*17)%256, (uid*31)%256, (uid*47)%256]
 
-def ros2_camera_id(camera_id):
-    ros2_id_map = {0: 41, 1: 46, 2: 40, 3: 29}
-    return ros2_id_map.get(camera_id, camera_id)
+def memory_status_str():
+    mem = psutil.virtual_memory()
+    return f"{mem.percent:.1f}% ({mem.used // (1024**3)}GB / {mem.total // (1024**3)}GB)"
+
+def check_system_memory():
+    return psutil.virtual_memory().percent >= MEMORY_CRITICAL * 100
+
+def process_rss_mb():
+    return psutil.Process().memory_info().rss // (1024**2)
+
+def transform_pose_to_ros(trans, quat_xyzw):
+    """Convert pose from cuVSLAM (X-right, Y-down, Z-forward) to ROS (X-forward, Y-left, Z-up)."""
+    trans_ros = np.array([trans[2], -trans[0], -trans[1]])
+    q_cb = Rotation.from_quat([_Q_CUVSLAM_TO_ROS[0], _Q_CUVSLAM_TO_ROS[1],
+                                _Q_CUVSLAM_TO_ROS[2], _Q_CUVSLAM_TO_ROS[3]])
+    q_cuv = Rotation.from_quat([quat_xyzw[0], quat_xyzw[1], quat_xyzw[2], quat_xyzw[3]])
+    q_ros = (q_cb * q_cuv * q_cb.inv()).as_quat()  # [x, y, z, w]
+    return trans_ros, np.array([q_ros[0], q_ros[1], q_ros[2], q_ros[3]])
 
 # ==========  ROS2 Publisher ==========
 class CameraPosePublisher(Node):
@@ -130,7 +187,7 @@ class CameraPosePublisher(Node):
 def vio_process(camera_id, device_id, num_cameras, vis_queue, traj_queue, enable_viz):
     if ROS2_AVAILABLE:
         rclpy.init(args=None)
-        ros_node = CameraPosePublisher(ros2_camera_id(camera_id))
+        ros_node = CameraPosePublisher(camera_id)
     else:
         ros_node = None
 
@@ -142,6 +199,8 @@ def vio_process(camera_id, device_id, num_cameras, vis_queue, traj_queue, enable
         return
 
     device = dai.Device(target)
+    mounting = CAMERA_MOUNTING.get(camera_id, "normal")
+    print(f"[Cam {camera_id}] mount={mounting}, convention={'Z-up' if POSE_CONVENTION == 'ros' else 'Z-fwd'}")
     calib = device.readCalibration()
     stereo = get_stereo_calib(calib, RESOLUTION)
     cams = [set_cuvslam_camera(stereo["left"]), set_cuvslam_camera(stereo["right"])]
@@ -151,12 +210,16 @@ def vio_process(camera_id, device_id, num_cameras, vis_queue, traj_queue, enable
 
     odom_cfg = vslam.Tracker.OdometryConfig(
         async_sba=True,
-        enable_final_landmarks_export=True,
+        enable_final_landmarks_export=False,
         enable_observations_export=True,
         rectified_stereo_camera=False,
         odometry_mode=vslam.Tracker.OdometryMode.Inertial
     )
-    slam_cfg = vslam.Tracker.SlamConfig()
+    slam_cfg = vslam.Tracker.SlamConfig(
+        enable_reading_internals=False,
+        max_landmarks_distance=30.0,
+        throttling_time_ms=1000,
+    )
     tracker = vslam.Tracker(rig, odom_cfg, slam_config=slam_cfg)
 
     pipeline = dai.Pipeline(device)
@@ -239,6 +302,8 @@ def vio_process(camera_id, device_id, num_cameras, vis_queue, traj_queue, enable
                 continue
 
             trans = pose.translation.copy(); quat = pose.rotation.copy()
+            if POSE_CONVENTION == "ros":
+                trans, quat = transform_pose_to_ros(trans, quat)
             traj_full.append((ts_ns, trans, quat))
 
             # 序列化特征点
@@ -254,8 +319,13 @@ def vio_process(camera_id, device_id, num_cameras, vis_queue, traj_queue, enable
                 print(f"[Cam {camera_id}] pos: ({trans[0]:.3f}, {trans[1]:.3f}, {trans[2]:.3f}) "
                       f"quat: ({quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f})")
 
-            # 仅在启用可视化且队列有效时发送数据
-            if enable_viz and vis_queue is not None:
+            # 定期 GC + 内存日志（每 300 帧）
+            if frame_id % 300 == 0:
+                gc.collect()
+                print(f"[Cam {camera_id}] RSS: {process_rss_mb()}MB")
+
+            # 仅在启用可视化且队列有效时发送数据（跳帧发送，降低队列压力）
+            if enable_viz and vis_queue is not None and frame_id % VIZ_FRAME_SKIP == 0:
                 vis_queue.put({
                     'camera_id': camera_id,
                     'timestamp_ns': ts_ns,
@@ -282,6 +352,50 @@ def vio_process(camera_id, device_id, num_cameras, vis_queue, traj_queue, enable
         print(f"[Camera {camera_id}] Finished. {len(traj_full)} poses.")
 
 
+def shutdown_processes(processes, reason=""):
+    """Gracefully shutdown all VIO processes — shared by Ctrl+C and memory watchdog."""
+    if reason:
+        print(f"\n!!! {reason} !!!")
+    print(f"System memory: {memory_status_str()}")
+    for p in processes:
+        if p.is_alive():
+            os.kill(p.pid, signal.SIGINT)
+    for p in processes:
+        p.join(timeout=5)
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=2)
+
+
+def save_trajectories(traj_queue):
+    if not ENABLE_HDF5:
+        while not traj_queue.empty():
+            _, _ = traj_queue.get()
+        print("HDF5 writing disabled. Trajectories not saved.")
+        return
+    all_traj = {}
+    while not traj_queue.empty():
+        cid, data = traj_queue.get()
+        all_traj[cid] = data
+    if not all_traj:
+        print("Warning: No trajectory data received, nothing saved.")
+        return
+    with h5py.File("multi_oak_vio.h5", "w") as f:
+        for cid, data in all_traj.items():
+            if not data:
+                continue
+            timestamps = np.array([d[0] for d in data])
+            positions = np.array([d[1] for d in data])
+            quats = np.array([d[2] for d in data])
+            grp = f.create_group(f"cam_{cid}")
+            grp.create_dataset("timestamps", data=timestamps)
+            grp.create_dataset("positions", data=positions)
+            grp.create_dataset("quaternions_xyzw", data=quats)
+            print(f"Saved cam_{cid}: {len(timestamps)} poses.")
+    print("All trajectories saved to multi_oak_vio.h5")
+
+
 # ==========  Main Process ==========
 def main():
     set_start_method('spawn', force=True)
@@ -290,6 +404,8 @@ def main():
     enable_viz = ENABLE_VISUALIZATION
     print(f"Visualization: {'ON' if enable_viz else 'OFF'}")
     print(f"HDF5 saving: {'ON' if ENABLE_HDF5 else 'OFF'}")
+    print(f"Pose convention: {'Z-up (ROS)' if POSE_CONVENTION == 'ros' else 'Z-fwd (cuVSLAM/OpenCV)'}")
+    print(f"Camera mounting: {CAMERA_MOUNTING if CAMERA_MOUNTING else 'all normal'}")
 
     if enable_viz:
         rr.init("multi_oak_vio", spawn=True)
@@ -301,16 +417,28 @@ def main():
         print("No OAK-D devices found.")
         return
 
-    num_cameras = len(infos)
-    print(f"Found {num_cameras} device(s):")
+    # Resolve stable logical camera IDs from MXID map
+    convention_str = "X-fwd Y-left Z-up (ROS)" if POSE_CONVENTION == "ros" else "X-right Y-down Z-fwd (cuVSLAM)"
+    device_assignments = []  # (cid, mxid, name, mounting)
+    print(f"Found {len(infos)} device(s):")
     for i, info in enumerate(infos):
-        print(f"  {i}: {info.name} (deviceId: {info.deviceId})")
+        cid = resolve_camera_id(info.deviceId, i)
+        mounting = CAMERA_MOUNTING.get(cid, "normal")
+        device_assignments.append((cid, info.deviceId, info.name, mounting))
+        map_mark = "*" if info.deviceId in CAMERA_ID_MAP else " "
+        print(f"  [{map_mark}] cid={cid} mxid={info.deviceId} name={info.name} mount={mounting}")
+
+    if not CAMERA_ID_MAP:
+        print("  Hint: set CAMERA_ID_MAP = {mxid: cid, ...} for stable IDs across USB ports.")
+    print(f"  Frame convention: {convention_str}")
+
+    num_cameras = len(device_assignments)
 
     # ---------- 蓝图 ----------
     if enable_viz:
         cam_views = []
-        for i in range(num_cameras):
-            cam_views.append(rrb.Spatial2DView(origin=f"cam_{i}/left", name=f"cam{i}-left"))
+        for cid, _, _, _ in device_assignments:
+            cam_views.append(rrb.Spatial2DView(origin=f"cam_{cid}/left", name=f"cam{cid}-left"))
         left_col = rrb.Vertical(*cam_views)
         right_3d = rrb.Spatial3DView(name="3D")
         blueprint = rrb.Blueprint(rrb.Horizontal(left_col, right_3d))
@@ -318,20 +446,21 @@ def main():
 
     # ---------- 轨迹偏移（虚拟起点）----------
     offsets = {}
+    sorted_cids = sorted(cid for cid, _, _, _ in device_assignments)
     if num_cameras == 1:
-        offsets[0] = np.zeros(3)
+        offsets[sorted_cids[0]] = np.zeros(3)
     elif num_cameras == 2:
-        offsets[0] = np.array([-0.5, 0.0, 0.0])
-        offsets[1] = np.array([ 0.5, 0.0, 0.0])
+        offsets[sorted_cids[0]] = np.array([-0.5, 0.0, 0.0])
+        offsets[sorted_cids[1]] = np.array([ 0.5, 0.0, 0.0])
     elif num_cameras == 3:
-        offsets[0] = np.array([-0.5, -0.5, 0])
-        offsets[1] = np.array([ 0.5, -0.5, 0])
-        offsets[2] = np.array([ 0.0,  0.5, 0])
+        offsets[sorted_cids[0]] = np.array([-0.5, -0.5, 0])
+        offsets[sorted_cids[1]] = np.array([ 0.5, -0.5, 0])
+        offsets[sorted_cids[2]] = np.array([ 0.0,  0.5, 0])
     else:
-        offsets[0] = np.array([-0.5, -0.5, 0])
-        offsets[1] = np.array([ 0.5, -0.5, 0])
-        offsets[2] = np.array([-0.5,  0.5, 0])
-        offsets[3] = np.array([ 0.5,  0.5, 0])
+        offsets[sorted_cids[0]] = np.array([-0.5, -0.5, 0])
+        offsets[sorted_cids[1]] = np.array([ 0.5, -0.5, 0])
+        offsets[sorted_cids[2]] = np.array([-0.5,  0.5, 0])
+        offsets[sorted_cids[3]] = np.array([ 0.5,  0.5, 0])
 
     # ---------- 队列 ----------
     vis_queue = Queue() if enable_viz else None
@@ -339,21 +468,23 @@ def main():
     processes = []
 
     # ---------- 启动子进程 ----------
-    for cid, info in enumerate(infos):
+    for cid, mxid, _, mounting in device_assignments:
         p = Process(target=vio_process,
-                    args=(cid, info.deviceId, num_cameras,
+                    args=(cid, mxid, num_cameras,
                           vis_queue, traj_queue, enable_viz))
         p.start()
         processes.append(p)
 
     # ---------- 主循环 ----------
+    shutdown_reason = ""
     try:
         if enable_viz:
             from collections import deque
             max_traj_len = 2000
-            trajectories = {cid: deque(maxlen=max_traj_len) for cid in range(num_cameras)}
+            trajectories = {cid: deque(maxlen=max_traj_len) for cid in sorted_cids}
             viz_frame_id = 0
-            last_traj_update = {cid: 0 for cid in range(num_cameras)}
+            last_traj_update = {cid: 0 for cid in sorted_cids}
+            last_mem_check = time.time()
 
             while any(p.is_alive() for p in processes):
                 while not vis_queue.empty():
@@ -404,53 +535,43 @@ def main():
                             rr.log(f"{prefix}/left/observations",
                                    rr.Points2D(pts, radii=4, colors=cols))
                 time.sleep(0.001)
+
+                # ---------- 内存看门狗 ----------
+                now = time.time()
+                if now - last_mem_check >= MEMORY_CHECK_INTERVAL:
+                    last_mem_check = now
+                    if check_system_memory():
+                        shutdown_reason = "CRITICAL: System memory exhausted, auto-terminating"
+                        shutdown_processes(processes, shutdown_reason)
+                        break
         else:
             print("Visualization disabled. Waiting for VIO processes...")
+            last_mem_check = time.time()
+            last_gc = time.time()
             while any(p.is_alive() for p in processes):
                 time.sleep(0.1)
+
+                now = time.time()
+                if now - last_mem_check >= MEMORY_CHECK_INTERVAL:
+                    last_mem_check = now
+                    if check_system_memory():
+                        shutdown_reason = "CRITICAL: System memory exhausted, auto-terminating"
+                        shutdown_processes(processes, shutdown_reason)
+                        break
+                # 定期 GC（每 30 秒）
+                if now - last_gc >= 30:
+                    gc.collect()
+                    last_gc = now
+                    print(f"Main RSS: {process_rss_mb()}MB, system: {memory_status_str()}")
     except KeyboardInterrupt:
-        print("\nCtrl+C detected, sending SIGINT to all VIO processes...")
-        for p in processes:
-            if p.is_alive():
-                os.kill(p.pid, signal.SIGINT)      # 关键：发送中断信号，触发子进程的 except KeyboardInterrupt
-
-        # 等待子进程完成 finally 并退出（最多等 5 秒）
-        for p in processes:
-            p.join(timeout=5)
-
-        # 如果仍有未退出进程，强制终止（此时 finally 已执行完，数据应已入队）
-        for p in processes:
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=2)
+        print("\nCtrl+C detected...")
+        shutdown_reason = "user interrupt"
+        shutdown_processes(processes)
 
     # ---------- 保存 HDF5 ----------
-    if ENABLE_HDF5:
-        all_traj = {}
-        while not traj_queue.empty():
-            cid, data = traj_queue.get()
-            all_traj[cid] = data
-
-        if all_traj:
-            with h5py.File("multi_oak_vio.h5", "w") as f:
-                for cid, data in all_traj.items():
-                    if not data:
-                        continue
-                    timestamps = np.array([d[0] for d in data])
-                    positions = np.array([d[1] for d in data])
-                    quats = np.array([d[2] for d in data])
-                    grp = f.create_group(f"cam_{cid}")
-                    grp.create_dataset("timestamps", data=timestamps)
-                    grp.create_dataset("positions", data=positions)
-                    grp.create_dataset("quaternions_xyzw", data=quats)
-                    print(f"Saved cam_{cid}: {len(timestamps)} poses.")
-            print("All trajectories saved to multi_oak_vio.h5")
-        else:
-            print("Warning: No trajectory data received, nothing saved.")
-    else:
-        while not traj_queue.empty():
-            _, _ = traj_queue.get()
-        print("HDF5 writing disabled. Trajectories not saved.")
+    save_trajectories(traj_queue)
+    if shutdown_reason:
+        print(f"Exit reason: {shutdown_reason}")
 
 
 if __name__ == "__main__":
