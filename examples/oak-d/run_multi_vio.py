@@ -39,7 +39,7 @@ class TuningParams:
     # --- 相机 ---
     fps: int = 30
     resolution: tuple[int, int] = (640, 480)
-    warmup_frames: int = 60            # 前 N 帧用于重力初始化，不输出位姿
+    warmup_frames: int = 200            # 前 N 帧用于重力初始化，不输出位姿
 
     # --- IMU 噪声（OAK-D 标定值 × 系数）---
     imu_frequency: int = 200
@@ -62,10 +62,10 @@ class TuningParams:
 
     # --- SLAM ---
     enable_reading_internals: bool = False
-    max_landmarks_distance: float = 30.0
-    max_map_size: int = 300
-    map_cell_size: float = 0.0          # 0 = 从基线自动计算
-    throttling_time_ms: int = 1000
+    max_landmarks_distance: float = 30.0    #  回环匹配时包含的最远路标距离
+    max_map_size: int = 300                 # 位姿图节点上限
+    map_cell_size: float = 0.0              # 空间索引网格大小 (0=自动)
+    throttling_time_ms: int = 1000          # 两次回环检测之间的最小间隔
 
 TP = TuningParams()
 
