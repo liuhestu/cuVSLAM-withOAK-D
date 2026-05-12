@@ -32,7 +32,7 @@ except ImportError:
 
 # ==========  Configuration ==========
 # 默认值：可视化开启，HDF5保存开启
-# 可以通过修改下面两行为 False 来改变默认行为；环境变量优先级更高
+# 可以通过修改下面两行为 False 来改变默认行为
 DEFAULT_ENABLE_VIZ = False
 DEFAULT_ENABLE_HDF5 = False
 
@@ -468,6 +468,11 @@ def main():
     processes = []
 
     # ---------- 启动子进程 ----------
+    try:
+        vslam.warm_up_gpu()
+        print("GPU warmup done.")
+    except Exception as e:
+        print(f"GPU warmup skipped ({e})")
     for cid, mxid, _, mounting in device_assignments:
         p = Process(target=vio_process,
                     args=(cid, mxid, num_cameras,
